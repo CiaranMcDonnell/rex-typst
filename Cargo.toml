@@ -1,0 +1,21 @@
+[package]
+name = "rex-typst"
+version = "0.1.0"
+edition = "2024"
+description = "Live Typst preview in a Rex pane, drawn with kitty graphics"
+repository = "https://github.com/CiaranMcDonnell/rex-typst"
+rust-version = "1.92"
+
+[dependencies]
+anyhow = "1.0.104"
+base64 = "0.23.1"
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.29"
+flate2 = "1.1.11"
+notify = "8"
+serde_json = "1.0.154"
+typst = "0.15.1"
+typst-ide = "0.15.1"
+typst-kit = { version = "0.15.1", features = ["scan-fonts", "embedded-fonts", "system-files", "system-downloader", "datetime", "watcher"] }
+typst-layout = "0.15.1"
+typst-render = "0.15.1"
