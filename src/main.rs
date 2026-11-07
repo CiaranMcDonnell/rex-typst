@@ -54,6 +54,9 @@ struct Args {
     /// Don't scroll the preview to the editor's cursor.
     #[arg(long)]
     no_follow: bool,
+    /// Keep the editor's cursor in the middle of the preview.
+    #[arg(long)]
+    center: bool,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -102,7 +105,7 @@ struct Slot {
     /// Size on screen in cells.
     cols: u16,
     rows: u16,
-    /// Screen column of its left edge.
+    /// Column of its left edge, counting from the left of the widest page.
     col: u16,
     /// Pixels per point.
     scale: f64,
@@ -112,6 +115,13 @@ struct Slot {
 
 /// Gap between pages, in rows.
 const GAP: usize = 1;
+
+/// Zoom limits, relative to the fit. The widest page is also kept under
+/// MAX_PAGE_PX wide, so a zoomed page stays a sensible image to upload.
+const MIN_ZOOM: f64 = 0.25;
+const MAX_ZOOM: f64 = 4.0;
+const ZOOM_STEP: f64 = 1.25;
+const MAX_PAGE_PX: f64 = 6000.0;
 
 struct App {
     world: TypstWorld,
@@ -123,11 +133,19 @@ struct App {
     compile_ms: u128,
     term: Term,
     scroll: usize,
+    /// Columns scrolled right, when zoomed pages are wider than the pane.
+    hscroll: usize,
     fit: Fit,
+    /// Scale relative to the fit.
+    zoom: f64,
     invert: bool,
     follow: bool,
+    /// Keep the editor's cursor in the middle of the view.
+    center: bool,
     slots: Vec<Slot>,
     total_rows: usize,
+    /// Width of the widest page, in cells.
+    content_cols: usize,
     /// Rendered pages in the terminal's image store, by slot key.
     images: HashMap<u128, u32>,
     next_id: u32,
@@ -209,31 +227,49 @@ impl App {
         self.deps = deps;
     }
 
-    fn relayout(&mut self) {
-        self.slots.clear();
-        self.total_rows = 0;
-        let Some(doc) = &self.doc else { return };
+    /// Pixels per point that fit the pages in the pane, and the most the
+    /// zoom can be.
+    fn fit_scale(&self) -> Option<(f64, f64)> {
+        let doc = self.doc.as_ref()?;
         let t = self.term;
         let avail_w = (t.cols.saturating_sub(2) as u32 * t.cw).max(t.cw) as f64;
         let avail_h = (self.view_rows().saturating_sub(1) as u32 * t.ch).max(t.ch) as f64;
         let max_w = doc.pages().iter().map(|p| p.frame.width().to_pt()).fold(1.0, f64::max);
         let max_h = doc.pages().iter().map(|p| p.frame.height().to_pt()).fold(1.0, f64::max);
-        let scale = match self.fit {
+        let fit = match self.fit {
             Fit::Width => avail_w / max_w,
             Fit::Page => (avail_w / max_w).min(avail_h / max_h),
         }
         .max(0.05);
+        let max_zoom = MAX_ZOOM.min(MAX_PAGE_PX / (fit * max_w)).max(1.0);
+        Some((fit, max_zoom))
+    }
+
+    fn relayout(&mut self) {
+        self.slots.clear();
+        self.total_rows = 0;
+        self.content_cols = 0;
+        let Some((fit, max_zoom)) = self.fit_scale() else { return };
+        self.zoom = self.zoom.clamp(MIN_ZOOM, max_zoom);
+        let scale = fit * self.zoom;
+        let Some(doc) = &self.doc else { return };
+        let t = self.term;
         let mut top = 0;
         for (i, page) in doc.pages().iter().enumerate() {
             let w = (page.frame.width().to_pt() * scale).ceil() as u32;
             let h = (page.frame.height().to_pt() * scale).ceil() as u32;
-            let cols = w.div_ceil(t.cw).clamp(1, t.cols as u32) as u16;
-            let rows = h.div_ceil(t.ch).max(1) as u16;
+            let cols = w.div_ceil(t.cw).clamp(1, u16::MAX as u32) as u16;
+            let rows = h.div_ceil(t.ch).clamp(1, u16::MAX as u32) as u16;
             let key = hash128(&(self.page_hashes[i], scale.to_bits(), self.invert, t.cw, t.ch));
-            self.slots.push(Slot { top, cols, rows, col: (t.cols - cols) / 2, scale, key });
+            self.slots.push(Slot { top, cols, rows, col: 0, scale, key });
             top += rows as usize + GAP;
         }
         self.total_rows = top.saturating_sub(GAP);
+        // Center each page in the column of pages.
+        self.content_cols = self.slots.iter().map(|s| s.cols as usize).max().unwrap_or(0);
+        for s in &mut self.slots {
+            s.col = ((self.content_cols - s.cols as usize) / 2) as u16;
+        }
         // Images no page uses any more: draw frees them once their
         // replacements are on screen.
         let keys: HashSet<u128> = self.slots.iter().map(|s| s.key).collect();
@@ -253,8 +289,56 @@ impl App {
         self.total_rows.saturating_sub(self.view_rows())
     }
 
+    fn max_hscroll(&self) -> usize {
+        self.content_cols.saturating_sub(self.term.cols as usize)
+    }
+
+    /// Screen column of the left edge of the column of pages: centered when
+    /// the pages fit, else scrolled.
+    fn x_origin(&self) -> isize {
+        let cols = self.term.cols as usize;
+        if self.content_cols <= cols { ((cols - self.content_cols) / 2) as isize } else { -(self.hscroll as isize) }
+    }
+
     fn clamp_scroll(&mut self) {
         self.scroll = self.scroll.min(self.max_scroll());
+        self.hscroll = self.hscroll.min(self.max_hscroll());
+    }
+
+    fn hscroll_by(&mut self, delta: isize) {
+        self.hscroll = self.hscroll.saturating_add_signed(delta);
+        self.clamp_scroll();
+        self.dirty = true;
+    }
+
+    /// Zoom, keeping the middle of the view where it is.
+    fn set_zoom(&mut self, zoom: f64) {
+        let Some((_, max_zoom)) = self.fit_scale() else { return };
+        let zoom = zoom.clamp(MIN_ZOOM, max_zoom);
+        if (zoom - self.zoom).abs() < 1e-6 {
+            self.notify(format!("zoom {}%", (self.zoom * 100.0).round()));
+            return;
+        }
+        let view = self.view_rows();
+        let cols = self.term.cols as usize;
+        let mid = self.scroll + view / 2;
+        let anchor = self.slots.iter().rposition(|s| s.top <= mid).map(|i| {
+            let s = &self.slots[i];
+            (i, ((mid - s.top) as f64 / s.rows as f64).min(1.0))
+        });
+        let fx = if self.content_cols > cols {
+            (self.hscroll + cols / 2) as f64 / self.content_cols as f64
+        } else {
+            0.5
+        };
+        self.zoom = zoom;
+        self.relayout();
+        if let Some((s, fy)) = anchor.and_then(|(i, fy)| Some((self.slots.get(i)?, fy))) {
+            self.scroll = (s.top as f64 + fy * s.rows as f64 - (view / 2) as f64).max(0.0) as usize;
+        }
+        self.hscroll = (fx * self.content_cols as f64 - (cols / 2) as f64).max(0.0) as usize;
+        self.clamp_scroll();
+        self.notify(format!("zoom {}%", (self.zoom * 100.0).round()));
     }
 
     fn scroll_by(&mut self, delta: isize) {
@@ -278,16 +362,25 @@ impl App {
         }
     }
 
-    /// Scroll so a position in the document is in view, if it isn't.
-    fn reveal(&mut self, pos: &PagedPosition, center: bool) {
+    /// Scroll so a position in the document is in view, if it isn't, or
+    /// always with `force`. In center mode it goes to the middle of the view.
+    fn reveal(&mut self, pos: &PagedPosition, force: bool) {
         let Some(slot) = self.slots.get(pos.page.get() - 1) else { return };
         let row = slot.top + (pos.point.y.to_pt() * slot.scale / self.term.ch as f64) as usize;
+        let col = slot.col as usize + (pos.point.x.to_pt() * slot.scale / self.term.cw as f64) as usize;
+        let force = force || self.center;
         let view = self.view_rows();
-        if center || row < self.scroll || row >= self.scroll + view {
-            self.scroll = row.saturating_sub(view / 3);
-            self.clamp_scroll();
+        if force || row < self.scroll || row >= self.scroll + view {
+            let anchor = if self.center { view / 2 } else { view / 3 };
+            self.scroll = row.saturating_sub(anchor);
             self.dirty = true;
         }
+        let cols = self.term.cols as usize;
+        if self.content_cols > cols && (force || col < self.hscroll || col >= self.hscroll + cols) {
+            self.hscroll = col.saturating_sub(cols / 2);
+            self.dirty = true;
+        }
+        self.clamp_scroll();
     }
 
     /// Render a page into the terminal's image store, if it isn't there.
@@ -332,25 +425,29 @@ impl App {
         let mut out = b"\x1b[?2026h".to_vec();
         let t = self.term;
         let view = self.view_rows();
+        let origin = self.x_origin();
         let mut shown = HashSet::new();
         for i in 0..self.slots.len() {
             let (top, rows) = (self.slots[i].top, self.slots[i].rows as usize);
             let start = top.max(self.scroll);
             let end = (top + rows).min(self.scroll + view);
-            if start >= end {
+            // Screen columns the page covers, cut to the pane.
+            let left = origin + self.slots[i].col as isize;
+            let right = left + self.slots[i].cols as isize;
+            let (vl, vr) = (left.max(0), right.min(t.cols as isize));
+            if start >= end || vl >= vr {
                 continue;
             }
             let Some(id) = self.ensure_image(&mut out, i) else { continue };
-            let s = &self.slots[i];
             kitty::place(&mut out, &kitty::Placement {
                 id,
-                col: s.col,
+                col: vl as u16,
                 row: (start - self.scroll) as u16,
-                x: 0,
+                x: ((vl - left) as u32) * t.cw,
                 y: ((start - top) as u32) * t.ch,
-                w: s.cols as u32 * t.cw,
+                w: ((vr - vl) as u32) * t.cw,
                 h: ((end - start) as u32) * t.ch,
-                cols: s.cols,
+                cols: (vr - vl) as u16,
                 rows: (end - start) as u16,
             })?;
             shown.insert(id);
@@ -421,29 +518,43 @@ impl App {
         if self.fit == Fit::Page {
             flags.push_str("  page");
         }
+        if (self.zoom - 1.0).abs() > 1e-6 {
+            flags.push_str(&format!("  {}%", (self.zoom * 100.0).round()));
+        }
+        if self.center {
+            flags.push_str("  center");
+        }
         if self.invert {
             flags.push_str("  dark");
         }
         if !self.follow {
             flags.push_str("  nofollow");
         }
-        let hint = "  j/k scroll  n/p page  w fit  i dark  f follow  q quit";
-        let used = left_len + 2 + state_len + flags.len();
-        let hint = if used + hint.len() <= cols { hint } else { "" };
+        let used = left_len + 2 + state_len + flags.chars().count();
+        let hint = [
+            "  j/k scroll  +/- zoom  n/p page  w fit  c center  i dark  f follow  q quit",
+            "  j/k scroll  +/- zoom  n/p page  q quit",
+            "",
+        ]
+        .into_iter()
+        .find(|h| used + h.len() <= cols)
+        .unwrap_or("");
         format!("\x1b[2m{left}\x1b[0m  {state}\x1b[2m{flags}{hint}\x1b[0m")
     }
 
     fn click(&mut self, col: u16, row: u16) {
         let Some(doc) = &self.doc else { return };
         let doc_row = self.scroll + row as usize;
+        let doc_col = col as isize - self.x_origin();
         let Some(i) = self.slots.iter().position(|s| s.top <= doc_row && doc_row < s.top + s.rows as usize) else {
             return;
         };
         let s = &self.slots[i];
-        if col < s.col || col >= s.col + s.cols {
+        let page_col = doc_col - s.col as isize;
+        if page_col < 0 || page_col >= s.cols as isize {
             return;
         }
-        let x = (((col - s.col) as u32 * self.term.cw) as f64 + self.term.cw as f64 / 2.0) / s.scale;
+        let x = ((page_col as u32 * self.term.cw) as f64 + self.term.cw as f64 / 2.0) / s.scale;
         let y = (((doc_row - s.top) as u32 * self.term.ch) as f64 + self.term.ch as f64 / 2.0) / s.scale;
         let pos = PagedPosition { page: NonZeroUsize::new(i + 1).unwrap(), point: Point::new(Abs::pt(x), Abs::pt(y)) };
         match typst_ide::jump_from_click(&self.world, doc, &pos) {
@@ -480,6 +591,8 @@ impl App {
         let ctrl = k.modifiers.contains(KeyModifiers::CONTROL);
         let half = (self.view_rows() / 2).max(1) as isize;
         let full = self.view_rows().saturating_sub(2).max(1) as isize;
+        let hstep = (self.term.cols as isize / 8).max(2);
+        let wide = self.content_cols > self.term.cols as usize;
         match k.code {
             KeyCode::Char('q') => return false,
             KeyCode::Char('c') if ctrl => return false,
@@ -494,15 +607,30 @@ impl App {
                 self.scroll = self.max_scroll();
                 self.dirty = true;
             }
+            // Left and right scroll sideways when zoomed pages are wider
+            // than the pane, else turn pages.
+            KeyCode::Char('h') => self.hscroll_by(-hstep),
+            KeyCode::Char('l') => self.hscroll_by(hstep),
+            KeyCode::Left if wide => self.hscroll_by(-hstep),
+            KeyCode::Right if wide => self.hscroll_by(hstep),
             KeyCode::Char('n') | KeyCode::Char('J') | KeyCode::Right => self.goto_page(self.current_page() + 1),
             KeyCode::Char('p') | KeyCode::Char('K') | KeyCode::Left => {
                 self.goto_page(self.current_page().saturating_sub(1))
             }
+            KeyCode::Char('+') | KeyCode::Char('=') => self.set_zoom(self.zoom * ZOOM_STEP),
+            KeyCode::Char('-') | KeyCode::Char('_') => self.set_zoom(self.zoom / ZOOM_STEP),
+            KeyCode::Char('0') => self.set_zoom(1.0),
             KeyCode::Char('w') => {
                 let page = self.current_page();
                 self.fit = if self.fit == Fit::Width { Fit::Page } else { Fit::Width };
+                self.zoom = 1.0;
+                self.hscroll = 0;
                 self.relayout();
                 self.goto_page(page);
+            }
+            KeyCode::Char('c') => {
+                self.center = !self.center;
+                self.notify(if self.center { "keeping the cursor centered" } else { "not centering the cursor" });
             }
             KeyCode::Char('i') => {
                 self.invert = !self.invert;
@@ -630,11 +758,15 @@ fn start(args: &Args) -> anyhow::Result<()> {
         compile_ms: 0,
         term: Term::query(),
         scroll: 0,
+        hscroll: 0,
         fit: if args.fit_page { Fit::Page } else { Fit::Width },
+        zoom: 1.0,
         invert: args.invert,
         follow: !args.no_follow,
+        center: args.center,
         slots: Vec::new(),
         total_rows: 0,
+        content_cols: 0,
         images: HashMap::new(),
         next_id: 0,
         placed: HashSet::new(),
@@ -672,6 +804,17 @@ fn run(
                     }
                 }
                 Event::Mouse(m) => match m.kind {
+                    // Ctrl-wheel zooms; shift-wheel scrolls sideways.
+                    MouseEventKind::ScrollUp if m.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.set_zoom(app.zoom * ZOOM_STEP)
+                    }
+                    MouseEventKind::ScrollDown if m.modifiers.contains(KeyModifiers::CONTROL) => {
+                        app.set_zoom(app.zoom / ZOOM_STEP)
+                    }
+                    MouseEventKind::ScrollUp if m.modifiers.contains(KeyModifiers::SHIFT) => app.hscroll_by(-3),
+                    MouseEventKind::ScrollDown if m.modifiers.contains(KeyModifiers::SHIFT) => app.hscroll_by(3),
+                    MouseEventKind::ScrollLeft => app.hscroll_by(-3),
+                    MouseEventKind::ScrollRight => app.hscroll_by(3),
                     MouseEventKind::ScrollDown => app.scroll_by(3),
                     MouseEventKind::ScrollUp => app.scroll_by(-3),
                     MouseEventKind::Down(MouseButton::Left) => app.click(m.column, m.row),

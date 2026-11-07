@@ -18,6 +18,7 @@
 --   invert     start with a dark (inverted) preview
 --   fit_page   start fitting whole pages instead of the width
 --   follow     scroll to the editor's cursor (default true)
+--   center     keep the editor's cursor in the middle of the preview
 --   args       extra arguments for rex-typst, such as { "--root", "~/thesis" }
 
 local M = {}
@@ -30,6 +31,7 @@ M.options = {
   invert = false,
   fit_page = false,
   follow = true,
+  center = false,
   args = {},
 }
 
@@ -96,6 +98,7 @@ local function command(editor_id, args)
   if o.invert then cmd[#cmd + 1] = "--invert" end
   if o.fit_page then cmd[#cmd + 1] = "--fit-page" end
   if not o.follow then cmd[#cmd + 1] = "--no-follow" end
+  if o.center then cmd[#cmd + 1] = "--center" end
   for _, a in ipairs(o.args or {}) do cmd[#cmd + 1] = a end
   if args and args.file then cmd[#cmd + 1] = args.file end
   return cmd
@@ -194,6 +197,10 @@ function M.setup(opts)
   action("typst_fit", "Typst: Toggle Fit Width / Page", "Fit the page width, or whole pages.", key_action("w"))
   action("typst_dark", "Typst: Toggle Dark Preview", "Invert the preview's colors.", key_action("i"))
   action("typst_follow", "Typst: Toggle Follow Cursor", "Scroll the preview with the editor's cursor, or stop.", key_action("f"))
+  action("typst_center", "Typst: Toggle Center Cursor", "Keep the editor's cursor in the middle of the preview, or stop.", key_action("c"))
+  action("typst_zoom_in", "Typst: Zoom In", "Zoom the preview in.", key_action("+"))
+  action("typst_zoom_out", "Typst: Zoom Out", "Zoom the preview out.", key_action("-"))
+  action("typst_zoom_reset", "Typst: Reset Zoom", "Zoom the preview back to the fit.", key_action("0"))
   return M
 end
 

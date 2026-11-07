@@ -8,7 +8,8 @@ server is on another machine.
 - **Live as you type** in Neovim: unsaved changes compile straight from the buffer.
   Other editors update on save.
 - **Click to jump**: click anything in the preview and the editor jumps to its source.
-- **Follows your cursor** in Neovim.
+- **Follows your cursor** in Neovim, optionally keeping it centered in the preview.
+- **Zoom** in and out, and scroll sideways when the page is wider than the pane.
 - **Incremental**: the Typst compiler (0.15) is built in and keeps running, so a change
   recompiles only what it touched, and only redrawn pages are sent to the terminal.
 - Compile errors show under the preview and in Rex's status.
@@ -86,19 +87,34 @@ Actions, also in the command palette under **Typst**:
 | `typst_fit` | fit the page width, or whole pages |
 | `typst_dark` | invert the colors |
 | `typst_follow` | follow the cursor on or off |
+| `typst_center` | keep the cursor centered in the preview, on or off |
+| `typst_zoom_in`, `typst_zoom_out`, `typst_zoom_reset` | zoom the preview |
+
+To drive the preview from the editor, bind the actions you use, for example:
+
+```lua
+rex.bind("ctrl+space>=", "typst_zoom_in")
+rex.bind("ctrl+space>-", "typst_zoom_out")
+rex.bind("ctrl+space>0", "typst_zoom_reset")
+rex.bind("ctrl+space>c", "typst_center")
+```
 
 Keys in the preview pane:
 
 | Key | |
 | --- | --- |
-| `j` `k`, arrows, mouse wheel | scroll |
+| `j` `k`, `↑` `↓`, mouse wheel | scroll |
+| `h` `l`, shift-wheel, trackpad | scroll sideways when zoomed (`←` `→` too, else they turn pages) |
+| `+` `-`, ctrl-wheel | zoom in, out |
+| `0` | reset the zoom |
 | `ctrl-d` `ctrl-u`, `space` `b` | half page, page |
 | `n` `p` | next, previous page |
 | `g` `G` | first, last page |
 | click | jump the editor to that spot |
-| `w` | fit width / whole pages |
+| `w` | fit width / whole pages (resets the zoom) |
 | `i` | dark (inverted) preview |
 | `f` | follow the cursor on or off |
+| `c` | keep the cursor centered on or off |
 | `r` | recompile everything |
 | `q` | close |
 
@@ -113,6 +129,7 @@ require("rex-typst").setup{
   invert = false,             -- start dark
   fit_page = false,           -- start fitting whole pages
   follow = true,              -- scroll with the editor's cursor
+  center = false,             -- keep the cursor in the middle of the preview
   args = {},                  -- extra arguments, such as { "--root", "/path" }
 }
 ```
