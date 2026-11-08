@@ -1,7 +1,9 @@
 //! Kitty graphics protocol: upload images once, then place parts of them.
 //!
-//! Images travel inside the escape sequence (t=d) as zlib-compressed RGBA
-//! (f=32, o=z), so this works when the Rex server is on another machine.
+//! Images travel inside the escape sequence (t=d) as zlib-compressed RGB
+//! (f=24, o=z), so this works when the Rex server is on another machine.
+//! Pages are opaque, so RGB carries everything and takes a quarter less of
+//! the terminal's image memory than RGBA.
 //! q=2 keeps the terminal from replying into our input.
 
 use std::io::Write;
@@ -13,10 +15,10 @@ use flate2::write::ZlibEncoder;
 
 const CHUNK: usize = 4096;
 
-/// Upload RGBA pixels as image `id`, replacing any image with that id.
-pub fn upload(out: &mut impl Write, id: u32, width: u32, height: u32, rgba: &[u8]) -> std::io::Result<()> {
-    let mut z = ZlibEncoder::new(Vec::with_capacity(rgba.len() / 8), Compression::fast());
-    z.write_all(rgba)?;
+/// Upload RGB pixels as image `id`, replacing any image with that id.
+pub fn upload(out: &mut impl Write, id: u32, width: u32, height: u32, rgb: &[u8]) -> std::io::Result<()> {
+    let mut z = ZlibEncoder::new(Vec::with_capacity(rgb.len() / 8), Compression::fast());
+    z.write_all(rgb)?;
     let data = STANDARD.encode(z.finish()?);
     let bytes = data.as_bytes();
     let mut first = true;
@@ -26,7 +28,7 @@ pub fn upload(out: &mut impl Write, id: u32, width: u32, height: u32, rgba: &[u8
         let more = u8::from(end < bytes.len());
         let chunk = std::str::from_utf8(&bytes[i..end]).unwrap_or("");
         if first {
-            write!(out, "\x1b_Ga=t,f=32,o=z,s={width},v={height},i={id},q=2,m={more};{chunk}\x1b\\")?;
+            write!(out, "\x1b_Ga=t,f=24,o=z,s={width},v={height},i={id},q=2,m={more};{chunk}\x1b\\")?;
             first = false;
         } else {
             write!(out, "\x1b_Gm={more};{chunk}\x1b\\")?;

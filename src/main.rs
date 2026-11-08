@@ -26,7 +26,7 @@ use typst::utils::{Scalar, hash128};
 use typst_ide::Jump;
 use typst_layout::PagedDocument;
 
-use editor::{Editor, FromEditor, ToEditor};
+use editor::{Editor, EditorLink, FromEditor};
 use world::TypstWorld;
 
 #[derive(Parser)]
@@ -54,9 +54,17 @@ struct Args {
     /// Don't scroll the preview to the editor's cursor.
     #[arg(long)]
     no_follow: bool,
+    /// Leave the focus on the preview after a click jumps the editor.
+    #[arg(long)]
+    no_focus_editor: bool,
     /// Keep the editor's cursor in the middle of the preview.
     #[arg(long)]
     center: bool,
+    /// Megabytes of rendered pages to keep in the terminal. Pages further
+    /// from the view are freed past this, and rendered again when they come
+    /// back. Pages on screen are always kept.
+    #[arg(long, default_value_t = 40, value_name = "MB")]
+    image_mb: usize,
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -113,6 +121,20 @@ struct Slot {
     key: u128,
 }
 
+/// A compile error or warning, and where it is.
+struct Problem {
+    text: String,
+    /// File, 1-based line, and 1-based byte column.
+    at: Option<(PathBuf, usize, usize)>,
+}
+
+/// A rendered page in the terminal's image store.
+struct Image {
+    id: u32,
+    /// Raw size, which is what the terminal keeps.
+    bytes: usize,
+}
+
 /// Gap between pages, in rows.
 const GAP: usize = 1;
 
@@ -128,8 +150,10 @@ struct App {
     main: PathBuf,
     doc: Option<PagedDocument>,
     page_hashes: Vec<u128>,
-    errors: Vec<String>,
-    warnings: usize,
+    errors: Vec<Problem>,
+    warnings: Vec<Problem>,
+    /// The error or warning `e` goes to next.
+    next_problem: usize,
     compile_ms: u128,
     term: Term,
     scroll: usize,
@@ -147,14 +171,16 @@ struct App {
     /// Width of the widest page, in cells.
     content_cols: usize,
     /// Rendered pages in the terminal's image store, by slot key.
-    images: HashMap<u128, u32>,
+    images: HashMap<u128, Image>,
+    /// Bytes of images to keep in the store, past the ones on screen.
+    image_budget: usize,
     next_id: u32,
     placed: HashSet<u32>,
     /// Images no page uses any more. They stay on screen until the next draw
     /// has placed their replacements, so a changed page never blinks out.
     stale: Vec<u32>,
     message: Option<(String, Instant)>,
-    editor_tx: mpsc::Sender<ToEditor>,
+    editor: EditorLink,
     watcher: notify::RecommendedWatcher,
     watched: HashSet<PathBuf>,
     deps: HashSet<PathBuf>,
@@ -183,7 +209,8 @@ impl App {
         let start = Instant::now();
         let Warned { output, warnings } = typst::compile::<PagedDocument>(&self.world);
         self.compile_ms = start.elapsed().as_millis();
-        self.warnings = warnings.len();
+        let old: Vec<String> = self.errors.iter().chain(&self.warnings).map(|p| p.text.clone()).collect();
+        self.warnings = warnings.iter().map(|d| self.describe(d)).collect();
         match output {
             Ok(doc) => {
                 self.page_hashes = doc.pages().iter().map(hash128).collect();
@@ -197,20 +224,49 @@ impl App {
                 program_status("error", &format!("Compile error in {}", file_name(&self.main)));
             }
         }
+        // Start over at the first one when they change.
+        if !self.errors.iter().chain(&self.warnings).map(|p| &p.text).eq(old.iter()) {
+            self.next_problem = 0;
+        }
         self.update_watches();
         self.relayout();
         self.dirty = true;
     }
 
-    fn describe(&self, d: &SourceDiagnostic) -> String {
-        let place = d.span.id().and_then(|id| {
+    fn describe(&self, d: &SourceDiagnostic) -> Problem {
+        let at = d.span.id().and_then(|id| {
             let path = self.world.path(id)?;
             let range = self.world.range(d.span)?;
-            let line = self.world.source(id).ok()?.lines().byte_to_line(range.start)? + 1;
-            let shown = path.strip_prefix(self.world.root()).unwrap_or(&path).display().to_string();
-            Some(format!("{shown}:{line}: "))
+            let source = self.world.source(id).ok()?;
+            let lines = source.lines();
+            let line = lines.byte_to_line(range.start)?;
+            let col = range.start - lines.line_to_byte(line)?;
+            Some((path, line + 1, col + 1))
         });
-        format!("{}{}", place.unwrap_or_default(), d.message)
+        let place = at.as_ref().map(|(path, line, _)| {
+            let shown = path.strip_prefix(self.world.root()).unwrap_or(path).display().to_string();
+            format!("{shown}:{line}: ")
+        });
+        Problem { text: format!("{}{}", place.unwrap_or_default(), d.message), at }
+    }
+
+    /// Jump the editor to the next error, or warning when there are no
+    /// errors, going round.
+    fn goto_problem(&mut self) {
+        let list = if self.errors.is_empty() { &self.warnings } else { &self.errors };
+        let located: Vec<(&(PathBuf, usize, usize), &str)> =
+            list.iter().filter_map(|p| Some((p.at.as_ref()?, p.text.as_str()))).collect();
+        if located.is_empty() {
+            let msg = if list.is_empty() { "no errors or warnings" } else { "the errors aren't in a file" };
+            self.notify(msg);
+            return;
+        }
+        let i = self.next_problem % located.len();
+        let ((path, line, col), text) = (located[i].0.clone(), located[i].1.to_string());
+        let n = located.len();
+        self.next_problem = i + 1;
+        self.editor.goto(path, line, col);
+        self.notify(format!("{}/{n} {text}", i + 1));
     }
 
     /// Watch the directories of the files the last compile read.
@@ -274,14 +330,14 @@ impl App {
         // replacements are on screen.
         let keys: HashSet<u128> = self.slots.iter().map(|s| s.key).collect();
         let stale = &mut self.stale;
-        self.images.retain(|k, id| {
+        self.images.retain(|k, img| {
             let keep = keys.contains(k);
             if !keep {
-                stale.push(*id);
+                stale.push(img.id);
             }
             keep
         });
-        self.placed.retain(|id| self.images.values().any(|v| v == id));
+        self.placed.retain(|id| self.images.values().any(|v| v.id == *id));
         self.clamp_scroll();
     }
 
@@ -386,8 +442,8 @@ impl App {
     /// Render a page into the terminal's image store, if it isn't there.
     fn ensure_image(&mut self, out: &mut Vec<u8>, i: usize) -> Option<u32> {
         let slot = &self.slots[i];
-        if let Some(&id) = self.images.get(&slot.key) {
-            return Some(id);
+        if let Some(img) = self.images.get(&slot.key) {
+            return Some(img.id);
         }
         let page = self.doc.as_ref()?.pages().get(i)?;
         let opts = typst_render::RenderOptions { pixel_per_pt: Scalar::new(slot.scale), render_bleed: false };
@@ -396,26 +452,56 @@ impl App {
         let (pw, ph) = (pixmap.width(), pixmap.height());
         let w = slot.cols as u32 * self.term.cw;
         let h = slot.rows as u32 * self.term.ch;
-        let mut rgba = vec![0u8; (w * h * 4) as usize];
+        let mut rgb = vec![0u8; (w * h * 3) as usize];
         let src = pixmap.data();
         for y in 0..ph.min(h) {
             for x in 0..pw.min(w) {
                 let s = ((y * pw + x) * 4) as usize;
-                let d = ((y * w + x) * 4) as usize;
+                let d = ((y * w + x) * 3) as usize;
                 // Premultiplied alpha: put it over white, then maybe invert.
                 let a = src[s + 3];
                 for c in 0..3 {
                     let v = src[s + c].saturating_add(255 - a);
-                    rgba[d + c] = if self.invert { 255 - v } else { v };
+                    rgb[d + c] = if self.invert { 255 - v } else { v };
                 }
-                rgba[d + 3] = 255;
             }
         }
         self.next_id = self.next_id.wrapping_add(1).max(1);
         let id = self.next_id;
-        kitty::upload(out, id, w, h, &rgba).ok()?;
-        self.images.insert(slot.key, id);
+        kitty::upload(out, id, w, h, &rgb).ok()?;
+        self.images.insert(slot.key, Image { id, bytes: rgb.len() });
         Some(id)
+    }
+
+    /// Free the pages furthest from the view while the store holds more than
+    /// the budget. Terminals limit how much they keep, Rex's iPad app among
+    /// them, so a long document can't hold every page it has shown.
+    fn evict(&mut self, out: &mut Vec<u8>) -> io::Result<()> {
+        let mut total: usize = self.images.values().map(|i| i.bytes).sum();
+        if total <= self.image_budget {
+            return Ok(());
+        }
+        let (top, bottom) = (self.scroll, self.scroll + self.view_rows());
+        let mut far: Vec<(usize, u128)> = self
+            .slots
+            .iter()
+            .filter(|s| self.images.get(&s.key).is_some_and(|i| !self.placed.contains(&i.id)))
+            .map(|s| {
+                let end = s.top + s.rows as usize;
+                (if end <= top { top - end } else { s.top.saturating_sub(bottom) }, s.key)
+            })
+            .collect();
+        far.sort_by(|a, b| b.0.cmp(&a.0));
+        for (_, key) in far {
+            if total <= self.image_budget {
+                break;
+            }
+            if let Some(img) = self.images.remove(&key) {
+                kitty::delete(out, img.id)?;
+                total -= img.bytes;
+            }
+        }
+        Ok(())
     }
 
     fn draw(&mut self) -> io::Result<()> {
@@ -460,6 +546,7 @@ impl App {
         for id in self.stale.drain(..) {
             kitty::delete(&mut out, id)?;
         }
+        self.evict(&mut out)?;
 
         // Errors above the status line, then the status line. Clear the rows
         // the last draw's errors used first.
@@ -469,7 +556,7 @@ impl App {
         self.error_rows = self.errors.len().min(3);
         for (k, e) in self.errors.iter().take(3).enumerate() {
             let row = view + k + 1;
-            write!(out, "\x1b[{row};1H\x1b[2K\x1b[31m{}\x1b[0m", clip(e, t.cols as usize))?;
+            write!(out, "\x1b[{row};1H\x1b[2K\x1b[31m{}\x1b[0m", clip(&e.text, t.cols as usize))?;
         }
         let status = self.status_line();
         write!(out, "\x1b[{};1H\x1b[2K{status}", t.rows)?;
@@ -505,8 +592,8 @@ impl App {
             let s = format!("✗ {} error{}", self.errors.len(), if self.errors.len() == 1 { "" } else { "s" });
             let l = s.chars().count();
             (format!("\x1b[31m{s}\x1b[0m"), l)
-        } else if self.warnings > 0 {
-            let s = format!("⚠ {}  {}ms", self.warnings, self.compile_ms);
+        } else if !self.warnings.is_empty() {
+            let s = format!("⚠ {}  {}ms", self.warnings.len(), self.compile_ms);
             let l = s.chars().count();
             (format!("\x1b[33m{s}\x1b[0m"), l)
         } else {
@@ -563,7 +650,7 @@ impl App {
                 let lines = source.lines();
                 let line = lines.byte_to_line(offset).unwrap_or(0);
                 let col = offset - lines.line_to_byte(line).unwrap_or(0);
-                let _ = self.editor_tx.send(ToEditor::Goto(path, line + 1, col + 1));
+                self.editor.goto(path, line + 1, col + 1);
             }
             Some(Jump::Position(p)) => self.reveal(&p, true),
             Some(Jump::Url(url)) => self.notify(format!("link: {}", url.as_str())),
@@ -628,6 +715,7 @@ impl App {
                 self.relayout();
                 self.goto_page(page);
             }
+            KeyCode::Char('e') => self.goto_problem(),
             KeyCode::Char('c') => {
                 self.center = !self.center;
                 self.notify(if self.center { "keeping the cursor centered" } else { "not centering the cursor" });
@@ -641,7 +729,10 @@ impl App {
                 self.follow = !self.follow;
                 self.notify(if self.follow { "following the cursor" } else { "not following the cursor" });
             }
+            // Recompile, and send every page to the terminal again, in case
+            // it dropped some.
             KeyCode::Char('r') => {
+                self.drop_images();
                 self.world.reset();
                 self.compile();
             }
@@ -650,17 +741,25 @@ impl App {
         true
     }
 
-    fn resize(&mut self) {
-        let page = self.current_page();
-        let at_top = self.scroll == 0;
-        self.term = Term::query();
+    /// Forget every page in the terminal's image store and clear the screen,
+    /// so the next draw renders and uploads them again.
+    fn drop_images(&mut self) {
         let mut out = Vec::new();
         let _ = kitty::delete_all(&mut out);
         let _ = io::stdout().write_all(&out);
         self.images.clear();
         self.placed.clear();
         self.stale.clear();
+        self.error_rows = 0;
         let _ = execute!(io::stdout(), terminal::Clear(terminal::ClearType::All));
+        self.dirty = true;
+    }
+
+    fn resize(&mut self) {
+        let page = self.current_page();
+        let at_top = self.scroll == 0;
+        self.term = Term::query();
+        self.drop_images();
         self.relayout();
         if !at_top {
             self.goto_page(page);
@@ -685,7 +784,7 @@ fn program_status(state: &str, msg: &str) {
     let _ = out.flush();
 }
 
-fn pick_file(args: &Args, editor: &Editor) -> anyhow::Result<PathBuf> {
+fn pick_file(args: &Args, editor: &mut Editor) -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     if let Some(f) = &args.file {
         return Ok(cwd.join(f));
@@ -716,24 +815,32 @@ fn main() {
     if let Err(err) = start(&args) {
         restore();
         eprintln!("\x1b[31mrex-typst: {err:#}\x1b[0m");
-        // In a pane of its own, keep the reason on screen until a key.
+        // In a pane of its own, keep the reason on screen until a key. Any
+        // key, so the q that typst_close sends closes it too.
         if std::io::IsTerminal::is_terminal(&io::stdin()) && args.editor_block.is_some() {
-            eprintln!("Press Enter to close.");
-            let _ = io::stdin().read_line(&mut String::new());
+            eprintln!("Press any key to close.");
+            if terminal::enable_raw_mode().is_ok() {
+                while let Ok(ev) = event::read() {
+                    if matches!(ev, Event::Key(k) if k.kind != KeyEventKind::Release) {
+                        break;
+                    }
+                }
+                let _ = terminal::disable_raw_mode();
+            }
         }
         std::process::exit(1);
     }
 }
 
 fn start(args: &Args) -> anyhow::Result<()> {
-    let editor = Editor::new(args.editor_block.clone(), args.nvim.clone());
-    let main = pick_file(args, &editor)?.canonicalize().context("the Typst file doesn't exist")?;
+    let mut editor = Editor::new(args.editor_block.clone(), args.nvim.clone(), !args.no_focus_editor);
+    let main = pick_file(args, &mut editor)?.canonicalize().context("the Typst file doesn't exist")?;
     let root = match &args.root {
         Some(r) => r.canonicalize()?,
         None => world::find_root(&main).canonicalize()?,
     };
     let world = TypstWorld::new(root, &main)?;
-    let (editor_tx, editor_rx) = editor.spawn();
+    let (editor, editor_rx) = editor.spawn();
 
     let (fs_tx, fs_rx) = mpsc::channel::<notify::Result<notify::Event>>();
     let watcher = notify::recommended_watcher(fs_tx)?;
@@ -746,7 +853,9 @@ fn start(args: &Args) -> anyhow::Result<()> {
     }));
     terminal::enable_raw_mode()?;
     execute!(io::stdout(), terminal::EnterAlternateScreen, cursor::Hide, event::EnableMouseCapture)?;
-    print!("\x1b]2;typst · {}\x1b\\", file_name(&main));
+    // No autowrap: a line that runs past the last column of the last row
+    // would scroll the screen, and the pages with it.
+    print!("\x1b[?7l\x1b]2;typst · {}\x1b\\", file_name(&main));
 
     let mut app = App {
         world,
@@ -754,7 +863,8 @@ fn start(args: &Args) -> anyhow::Result<()> {
         doc: None,
         page_hashes: Vec::new(),
         errors: Vec::new(),
-        warnings: 0,
+        warnings: Vec::new(),
+        next_problem: 0,
         compile_ms: 0,
         term: Term::query(),
         scroll: 0,
@@ -768,11 +878,12 @@ fn start(args: &Args) -> anyhow::Result<()> {
         total_rows: 0,
         content_cols: 0,
         images: HashMap::new(),
+        image_budget: args.image_mb.saturating_mul(1 << 20),
         next_id: 0,
         placed: HashSet::new(),
         stale: Vec::new(),
         message: None,
-        editor_tx,
+        editor,
         watcher,
         watched: HashSet::new(),
         deps: HashSet::new(),
@@ -825,14 +936,22 @@ fn run(
             }
         }
 
-        // Unsaved edits and cursor moves from Neovim.
+        // Unsaved edits, saves, and cursor moves from Neovim. Take them all,
+        // then compile once.
         let mut cursor = None;
+        let mut edited = false;
         while let Ok(msg) = editor_rx.try_recv() {
             match msg {
                 FromEditor::Status(s) => app.notify(s),
+                FromEditor::Clean(path) => edited |= app.overlaid.remove(&path) && app.world.clear_overlay(&path),
+                FromEditor::Gone => {
+                    for path in std::mem::take(&mut app.overlaid) {
+                        edited |= app.world.clear_overlay(&path);
+                    }
+                }
                 FromEditor::Snapshot(s) => {
                     if s.path.extension().is_some_and(|e| e == "typ") && app.world.id(&s.path).is_some() {
-                        let changed = match (s.modified, s.text) {
+                        edited |= match (s.modified, s.text) {
                             (true, Some(text)) => {
                                 app.overlaid.insert(s.path.clone());
                                 app.world.set_overlay(s.path.clone(), text)
@@ -840,14 +959,15 @@ fn run(
                             (false, _) => app.overlaid.remove(&s.path) && app.world.clear_overlay(&s.path),
                             _ => false,
                         };
-                        if changed {
-                            app.world.reset();
-                            app.compile();
-                        }
-                        cursor = Some((s.path, s.line, s.col));
+                        // Don't scroll the preview back to where it sent us.
+                        cursor = (!s.jumped).then_some((s.path, s.line, s.col));
                     }
                 }
             }
+        }
+        if edited {
+            app.world.reset();
+            app.compile();
         }
         if let Some((path, line, col)) = cursor {
             if app.follow {
@@ -884,6 +1004,7 @@ fn restore() {
     let _ = kitty::delete_all(&mut out);
     let mut stdout = io::stdout();
     let _ = stdout.write_all(&out);
+    let _ = stdout.write_all(b"\x1b[?7h");
     let _ = execute!(stdout, event::DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen);
     let _ = terminal::disable_raw_mode();
 }

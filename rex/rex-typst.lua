@@ -19,6 +19,8 @@
 --   fit_page   start fitting whole pages instead of the width
 --   follow     scroll to the editor's cursor (default true)
 --   center     keep the editor's cursor in the middle of the preview
+--   focus_editor  focus the editor after a click jumps it (default true)
+--   image_mb   megabytes of rendered pages to keep in the pane (default 40)
 --   args       extra arguments for rex-typst, such as { "--root", "~/thesis" }
 
 local M = {}
@@ -32,6 +34,8 @@ M.options = {
   fit_page = false,
   follow = true,
   center = false,
+  focus_editor = true,
+  image_mb = 40,
   args = {},
 }
 
@@ -99,6 +103,11 @@ local function command(editor_id, args)
   if o.fit_page then cmd[#cmd + 1] = "--fit-page" end
   if not o.follow then cmd[#cmd + 1] = "--no-follow" end
   if o.center then cmd[#cmd + 1] = "--center" end
+  if not o.focus_editor then cmd[#cmd + 1] = "--no-focus-editor" end
+  if o.image_mb then
+    cmd[#cmd + 1] = "--image-mb"
+    cmd[#cmd + 1] = tostring(o.image_mb)
+  end
   for _, a in ipairs(o.args or {}) do cmd[#cmd + 1] = a end
   if args and args.file then cmd[#cmd + 1] = args.file end
   return cmd
@@ -135,10 +144,12 @@ function M.open(ctx, args)
   return { block_id = result.block_ids and result.block_ids[1] }
 end
 
+-- Close the pane itself rather than pressing q, so a preview that failed to
+-- start, and is showing why, closes too.
 function M.close(ctx)
   local preview = locate(ctx)
   if not preview then return { closed = false } end
-  press(preview.block_id, "q")
+  check(rex.call("block.close", { session_id = ctx.session_id, block_id = preview.block_id }))
   return { closed = true, block_id = preview.block_id }
 end
 
@@ -200,6 +211,8 @@ function M.setup(opts)
   action("typst_center", "Typst: Toggle Center Cursor", "Keep the editor's cursor in the middle of the preview, or stop.", key_action("c"))
   action("typst_zoom_in", "Typst: Zoom In", "Zoom the preview in.", key_action("+"))
   action("typst_zoom_out", "Typst: Zoom Out", "Zoom the preview out.", key_action("-"))
+  action("typst_goto_error", "Typst: Go to Error",
+    "Jump the editor to the next compile error, or warning when there are none.", key_action("e"))
   action("typst_zoom_reset", "Typst: Reset Zoom", "Zoom the preview back to the fit.", key_action("0"))
   return M
 end

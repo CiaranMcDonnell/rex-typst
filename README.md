@@ -7,7 +7,9 @@ server is on another machine.
 
 - **Live as you type** in Neovim: unsaved changes compile straight from the buffer.
   Other editors update on save.
-- **Click to jump**: click anything in the preview and the editor jumps to its source.
+- **Click to jump**: click anything in the preview and the editor jumps to its source,
+  and takes the focus.
+- **Go to errors**: `e` jumps the editor to each compile error in turn.
 - **Follows your cursor** in Neovim, optionally keeping it centered in the preview.
 - **Zoom** in and out, and scroll sideways when the page is wider than the pane.
 - **Incremental**: the Typst compiler (0.15) is built in and keeps running, so a change
@@ -88,6 +90,7 @@ Actions, also in the command palette under **Typst**:
 | `typst_dark` | invert the colors |
 | `typst_follow` | follow the cursor on or off |
 | `typst_center` | keep the cursor centered in the preview, on or off |
+| `typst_goto_error` | jump the editor to the next error, or warning when there are none |
 | `typst_zoom_in`, `typst_zoom_out`, `typst_zoom_reset` | zoom the preview |
 
 To drive the preview from the editor, bind the actions you use, for example:
@@ -97,6 +100,7 @@ rex.bind("ctrl+space>=", "typst_zoom_in")
 rex.bind("ctrl+space>-", "typst_zoom_out")
 rex.bind("ctrl+space>0", "typst_zoom_reset")
 rex.bind("ctrl+space>c", "typst_center")
+rex.bind("ctrl+space>e", "typst_goto_error")
 ```
 
 Keys in the preview pane:
@@ -111,11 +115,12 @@ Keys in the preview pane:
 | `n` `p` | next, previous page |
 | `g` `G` | first, last page |
 | click | jump the editor to that spot |
+| `e` | jump the editor to the next error (or warning) |
 | `w` | fit width / whole pages (resets the zoom) |
 | `i` | dark (inverted) preview |
 | `f` | follow the cursor on or off |
 | `c` | keep the cursor centered on or off |
-| `r` | recompile everything |
+| `r` | recompile everything and redraw every page |
 | `q` | close |
 
 ## Options
@@ -130,6 +135,8 @@ require("rex-typst").setup{
   fit_page = false,           -- start fitting whole pages
   follow = true,              -- scroll with the editor's cursor
   center = false,             -- keep the cursor in the middle of the preview
+  focus_editor = true,        -- focus the editor after a click or `e` jumps it
+  image_mb = 40,              -- megabytes of rendered pages to keep in the pane
   args = {},                  -- extra arguments, such as { "--root", "/path" }
 }
 ```
@@ -148,5 +155,10 @@ The binary embeds the Typst compiler through `typst`, `typst-kit` (files, fonts,
 packages) and `typst-ide` (click and cursor mapping). It watches the directories of the
 files the last compile read. Each page is rendered at the pane's pixel size, padded to
 whole cells, compressed, and uploaded once; scrolling only moves placements, showing the
-visible part of each page. With Neovim, a thread polls the cursor and buffer through
-`nvim --server … --remote-expr`.
+visible part of each page. Pages are kept in the terminal up to `image_mb`; past that the
+ones furthest from the view are freed and rendered again when they come back, since
+terminals (Rex's iPad app among them) limit how much image data a pane can hold.
+
+With Neovim, rex-typst keeps one msgpack-RPC connection to its socket and installs
+autocmds that push the cursor, the unsaved text of `.typ` buffers, and saves as they
+happen, so nothing polls while you work. It reconnects if Neovim restarts.
