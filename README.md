@@ -9,6 +9,8 @@ server is on another machine.
   Other editors update on save.
 - **Click to jump**: click anything in the preview and the editor jumps to its source,
   and takes the focus.
+- **Whole documents**: open it from any chapter and it previews the document that
+  includes it, found from your `#include`s without any setup.
 - **Go to errors**: `e` jumps the editor to each compile error in turn.
 - **Follows your cursor** in Neovim, optionally keeping it centered in the preview.
 - **Zoom** in and out, and scroll sideways when the page is wider than the pane.
@@ -79,6 +81,11 @@ without taking focus. It previews the file open in the editor, or with another e
 the `.typ` file it was started with, else `main.typ` or the only `.typ` file in the
 directory. Pass `file=` to choose: `rex do typst_toggle file=chapters/intro.typ`.
 
+Open it from a chapter and it previews the whole document: rex-typst reads the
+`#include`s and `#import`s in the project to find the file at the top, and following the
+cursor and clicking still work in every file it includes. Includes built from computed
+paths can't be followed, so pass `file=` for those.
+
 Actions, also in the command palette under **Typst**:
 
 | Action | |
@@ -88,6 +95,7 @@ Actions, also in the command palette under **Typst**:
 | `typst_next_page`, `typst_prev_page` | scroll the preview from the editor |
 | `typst_fit` | fit the page width, or whole pages |
 | `typst_dark` | invert the colors |
+| `typst_dark_images` | invert images too in the dark preview, or let them keep their colors |
 | `typst_follow` | follow the cursor on or off |
 | `typst_center` | keep the cursor centered in the preview, on or off |
 | `typst_goto_error` | jump the editor to the next error, or warning when there are none |
@@ -118,6 +126,7 @@ Keys in the preview pane:
 | `e` | jump the editor to the next error (or warning) |
 | `w` | fit width / whole pages (resets the zoom) |
 | `i` | dark (inverted) preview |
+| `I` | invert images too, or let them keep their colors |
 | `f` | follow the cursor on or off |
 | `c` | keep the cursor centered on or off |
 | `r` | recompile everything and redraw every page |
@@ -132,6 +141,7 @@ require("rex-typst").setup{
   width = 0.45,               -- share of the editor's width, for "split"
   bounds = { 0.5, 0.04, 0.48, 0.92 },  -- for "float"
   invert = false,             -- start dark
+  invert_images = false,      -- invert images too when dark; by default they keep their colors
   fit_page = false,           -- start fitting whole pages
   follow = true,              -- scroll with the editor's cursor
   center = false,             -- keep the cursor in the middle of the preview
@@ -143,6 +153,12 @@ require("rex-typst").setup{
 
 The project root is `$TYPST_ROOT`, else the nearest directory above the file with
 `typst.toml` or `.git` (but not your home directory), else the file's directory.
+
+The document a file belongs to is the one that includes or imports it, directly or
+through other files, and that nothing else includes. When several do, `main.typ` wins,
+then the one nearest the root. Finding it parses only the files that mention `include`
+or `import`, and compiles nothing; projects with more than 5,000 Typst files are left
+alone.
 
 ## Without Rex
 

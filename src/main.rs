@@ -2,6 +2,7 @@
 
 mod editor;
 mod kitty;
+mod project;
 mod world;
 
 use std::collections::{HashMap, HashSet};
@@ -21,7 +22,7 @@ use typst::World;
 use typst::WorldExt;
 use typst::diag::{Severity, SourceDiagnostic, Warned};
 use typst::introspection::PagedPosition;
-use typst::layout::{Abs, Point};
+use typst::layout::{Abs, Frame, FrameItem, Point, Size, Transform};
 use typst::utils::{Scalar, hash128};
 use typst_ide::Jump;
 use typst_layout::PagedDocument;
@@ -32,8 +33,9 @@ use world::TypstWorld;
 #[derive(Parser)]
 #[command(version, about = "Live Typst preview in a Rex pane, drawn with kitty graphics")]
 struct Args {
-    /// The file to preview. Default: the .typ file open in the editor pane,
-    /// else main.typ or the only .typ file in the current directory.
+    /// The file to preview. Default: the document that includes the .typ
+    /// file open in the editor pane, else that file, else main.typ or the
+    /// only .typ file in the current directory.
     file: Option<PathBuf>,
     /// The project root. Default: $TYPST_ROOT, else the nearest directory
     /// with typst.toml or .git, else the file's directory.
@@ -51,6 +53,9 @@ struct Args {
     /// Start with inverted colors, for a dark preview.
     #[arg(long)]
     invert: bool,
+    /// Invert images too, when inverting. By default they keep their colors.
+    #[arg(long)]
+    invert_images: bool,
     /// Don't scroll the preview to the editor's cursor.
     #[arg(long)]
     no_follow: bool,
@@ -163,6 +168,8 @@ struct App {
     /// Scale relative to the fit.
     zoom: f64,
     invert: bool,
+    /// Invert images along with the rest, when inverting.
+    invert_images: bool,
     follow: bool,
     /// Keep the editor's cursor in the middle of the view.
     center: bool,
@@ -316,7 +323,7 @@ impl App {
             let h = (page.frame.height().to_pt() * scale).ceil() as u32;
             let cols = w.div_ceil(t.cw).clamp(1, u16::MAX as u32) as u16;
             let rows = h.div_ceil(t.ch).clamp(1, u16::MAX as u32) as u16;
-            let key = hash128(&(self.page_hashes[i], scale.to_bits(), self.invert, t.cw, t.ch));
+            let key = hash128(&(self.page_hashes[i], scale.to_bits(), self.invert, self.invert_images, t.cw, t.ch));
             self.slots.push(Slot { top, cols, rows, col: 0, scale, key });
             top += rows as usize + GAP;
         }
@@ -454,15 +461,18 @@ impl App {
         let h = slot.rows as u32 * self.term.ch;
         let mut rgb = vec![0u8; (w * h * 3) as usize];
         let src = pixmap.data();
+        // Pixels under images, which keep their colors in a dark preview.
+        let keep = (self.invert && !self.invert_images).then(|| image_mask(&page.frame, slot.scale, pw, ph)).flatten();
         for y in 0..ph.min(h) {
             for x in 0..pw.min(w) {
                 let s = ((y * pw + x) * 4) as usize;
                 let d = ((y * w + x) * 3) as usize;
+                let invert = self.invert && !keep.as_ref().is_some_and(|m| m[(y * pw + x) as usize]);
                 // Premultiplied alpha: put it over white, then maybe invert.
                 let a = src[s + 3];
                 for c in 0..3 {
                     let v = src[s + c].saturating_add(255 - a);
-                    rgb[d + c] = if self.invert { 255 - v } else { v };
+                    rgb[d + c] = if invert { 255 - v } else { v };
                 }
             }
         }
@@ -725,6 +735,17 @@ impl App {
                 self.relayout();
                 self.dirty = true;
             }
+            KeyCode::Char('I') => {
+                self.invert_images = !self.invert_images;
+                if self.invert {
+                    self.relayout();
+                }
+                self.notify(if self.invert_images {
+                    "inverting images in the dark preview"
+                } else {
+                    "images keep their colors in the dark preview"
+                });
+            }
             KeyCode::Char('f') => {
                 self.follow = !self.follow;
                 self.notify(if self.follow { "following the cursor" } else { "not following the cursor" });
@@ -784,6 +805,66 @@ fn program_status(state: &str, msg: &str) {
     let _ = out.flush();
 }
 
+/// A rectangle on the page in points: left, top, right, bottom.
+type Rect = [f64; 4];
+
+/// Which pixels of a page rendered at `scale` lie under an image, or None if
+/// it has no images.
+fn image_mask(frame: &Frame, scale: f64, pw: u32, ph: u32) -> Option<Vec<bool>> {
+    let mut rects = Vec::new();
+    image_rects(frame, Transform::identity(), None, &mut rects);
+    if rects.is_empty() {
+        return None;
+    }
+    let mut mask = vec![false; (pw * ph) as usize];
+    for [l, t, r, b] in rects {
+        let px = |v: f64, max: u32| ((v * scale).round().max(0.0) as u32).min(max);
+        let (x0, x1, y0, y1) = (px(l, pw), px(r, pw), px(t, ph), px(b, ph));
+        for y in y0..y1 {
+            mask[(y * pw + x0) as usize..(y * pw + x1) as usize].fill(true);
+        }
+    }
+    Some(mask)
+}
+
+/// The bounding boxes of a frame's images on the page, cut to the clipped
+/// groups they're in. A rotated image counts as its whole bounding box.
+fn image_rects(frame: &Frame, ts: Transform, clip: Option<Rect>, out: &mut Vec<Rect>) {
+    let bbox = |ts: Transform, size: Size| -> Rect {
+        let corners = [(0.0, 0.0), (1.0, 0.0), (0.0, 1.0), (1.0, 1.0)].map(|(fx, fy)| {
+            Point::new(size.x * fx, size.y * fy).transform(ts)
+        });
+        let xs = corners.map(|p| p.x.to_pt());
+        let ys = corners.map(|p| p.y.to_pt());
+        let fold = |v: [f64; 4], f: fn(f64, f64) -> f64| v.into_iter().reduce(f).unwrap_or(0.0);
+        [fold(xs, f64::min), fold(ys, f64::min), fold(xs, f64::max), fold(ys, f64::max)]
+    };
+    let cut = |r: Rect, c: Option<Rect>| match c {
+        Some(c) => [r[0].max(c[0]), r[1].max(c[1]), r[2].min(c[2]), r[3].min(c[3])],
+        None => r,
+    };
+    for (pos, item) in frame.items() {
+        let at = ts.pre_concat(Transform::translate(pos.x, pos.y));
+        match item {
+            FrameItem::Group(group) => {
+                let inner = at.pre_concat(group.transform);
+                let clip = match group.clip {
+                    Some(_) => Some(cut(bbox(inner, group.frame.size()), clip)),
+                    None => clip,
+                };
+                image_rects(&group.frame, inner, clip, out);
+            }
+            FrameItem::Image(_, size, _) => {
+                let r = cut(bbox(at, *size), clip);
+                if r[0] < r[2] && r[1] < r[3] {
+                    out.push(r);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn pick_file(args: &Args, editor: &mut Editor) -> anyhow::Result<PathBuf> {
     let cwd = std::env::current_dir()?;
     if let Some(f) = &args.file {
@@ -834,11 +915,13 @@ fn main() {
 
 fn start(args: &Args) -> anyhow::Result<()> {
     let mut editor = Editor::new(args.editor_block.clone(), args.nvim.clone(), !args.no_focus_editor);
-    let main = pick_file(args, &mut editor)?.canonicalize().context("the Typst file doesn't exist")?;
+    let open = pick_file(args, &mut editor)?.canonicalize().context("the Typst file doesn't exist")?;
     let root = match &args.root {
         Some(r) => r.canonicalize()?,
-        None => world::find_root(&main).canonicalize()?,
+        None => world::find_root(&open).canonicalize()?,
     };
+    // A chapter previews the whole document it's in, unless asked for itself.
+    let main = if args.file.is_some() { open.clone() } else { project::main_of(&root, &open) };
     let world = TypstWorld::new(root, &main)?;
     let (editor, editor_rx) = editor.spawn();
 
@@ -872,6 +955,7 @@ fn start(args: &Args) -> anyhow::Result<()> {
         fit: if args.fit_page { Fit::Page } else { Fit::Width },
         zoom: 1.0,
         invert: args.invert,
+        invert_images: args.invert_images,
         follow: !args.no_follow,
         center: args.center,
         slots: Vec::new(),
@@ -892,6 +976,9 @@ fn start(args: &Args) -> anyhow::Result<()> {
         error_rows: 0,
         dirty: true,
     };
+    if app.main != open {
+        app.notify(format!("previewing {}, which includes {}", file_name(&app.main), file_name(&open)));
+    }
     let result = run(&mut app, &editor_rx, &fs_rx);
     restore();
     program_status("clear", "");

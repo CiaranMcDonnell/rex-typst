@@ -16,6 +16,7 @@
 --   width      the preview's share of the editor's width, for "split"
 --   bounds     { x, y, w, h } as fractions of the window, for "float"
 --   invert     start with a dark (inverted) preview
+--   invert_images  invert images too in the dark preview (default false)
 --   fit_page   start fitting whole pages instead of the width
 --   follow     scroll to the editor's cursor (default true)
 --   center     keep the editor's cursor in the middle of the preview
@@ -31,6 +32,7 @@ M.options = {
   width = 0.45,
   bounds = { 0.5, 0.04, 0.48, 0.92 },
   invert = false,
+  invert_images = false,
   fit_page = false,
   follow = true,
   center = false,
@@ -100,6 +102,7 @@ local function command(editor_id, args)
   local o = M.options
   local cmd = { o.bin, "--editor-block", editor_id }
   if o.invert then cmd[#cmd + 1] = "--invert" end
+  if o.invert_images then cmd[#cmd + 1] = "--invert-images" end
   if o.fit_page then cmd[#cmd + 1] = "--fit-page" end
   if not o.follow then cmd[#cmd + 1] = "--no-follow" end
   if o.center then cmd[#cmd + 1] = "--center" end
@@ -207,6 +210,8 @@ function M.setup(opts)
   action("typst_prev_page", "Typst: Previous Page", "Scroll the preview to the previous page.", key_action("p"))
   action("typst_fit", "Typst: Toggle Fit Width / Page", "Fit the page width, or whole pages.", key_action("w"))
   action("typst_dark", "Typst: Toggle Dark Preview", "Invert the preview's colors.", key_action("i"))
+  action("typst_dark_images", "Typst: Toggle Dark Images",
+    "Invert images in the dark preview too, or let them keep their colors.", key_action("I"))
   action("typst_follow", "Typst: Toggle Follow Cursor", "Scroll the preview with the editor's cursor, or stop.", key_action("f"))
   action("typst_center", "Typst: Toggle Center Cursor", "Keep the editor's cursor in the middle of the preview, or stop.", key_action("c"))
   action("typst_zoom_in", "Typst: Zoom In", "Zoom the preview in.", key_action("+"))
