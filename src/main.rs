@@ -235,6 +235,8 @@ impl App {
         if !self.errors.iter().chain(&self.warnings).map(|p| &p.text).eq(old.iter()) {
             self.next_problem = 0;
         }
+        // Drop memoized results unused for the last 10 compiles, like `typst watch`.
+        typst::comemo::evict(10);
         self.update_watches();
         self.relayout();
         self.dirty = true;
